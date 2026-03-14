@@ -1,71 +1,134 @@
+# ==============================
+#      aichat.py - Back-end
+#      Ready for Render Deploy
+# ==============================
 import os
-import google.generativeai as genai
-from flask import Flask, request, jsonify
+import uuid
 import PyPDF2
-import chromadb
-from chromadb.utils import embedding_functions
-
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+from chromadb import Client, Settings
+import google.generativeai as genai
 
 app = Flask(__name__)
-# هذا السطر يسمح للـ React يكلم السيرفر من أي مكان
-CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- 1. إعداد Gemini بمفتاحك الجديد ---
-API_KEY = "AIzaSyC50y3Dkor20IV3CXnLKIVQDKF_5I3_PPU"
-genai.configure(api_key=API_KEY)
+# ==============================
+# 🔥 [أهم خطوة] حل CORS الجوهري
+# هذا السطر يفتح الأبواب لـ Vercel ولجوالك ولأي مكان
+# ==============================
+CORS(app)
 
-# --- 2. حل مشكلة الـ 404: اختيار الموديل المتاح تلقائياً ---
-try:
-    # الكود هنا بيسأل قوقل: "وش الموديلات اللي أقدر استخدمها؟"
-    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    # بيختار أول موديل شغال (غالباً بيكون gemini-pro أو gemini-1.5-flash)
-    model_to_use = available_models[0] if available_models else 'gemini-pro'
-    llm_model = genai.GenerativeModel(model_to_use)
-    print(f"--- [SUCCESS] Using Model: {model_to_use} ---")
-except Exception as e:
-    print(f"--- [ERROR] Model selection failed: {e} ---")
-    llm_model = genai.GenerativeModel('gemini-pro')
+# ==============================
+# 🔑 إعدادات Gemini و ChromaDB
+# ==============================
+# تأكد إن الـ API Key حقك صح
+genai.configure(api_key="ضع_هنا_API_KEY_الخاص_بك_من_GEMINI")
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- 3. إعداد الذاكرة (ChromaDB) ---
-client = chromadb.PersistentClient(path="./my_ai_memory")
-default_ef = embedding_functions.DefaultEmbeddingFunction()
-collection = client.get_or_create_collection(name="hamoud_docs", embedding_function=default_ef)
+# ChromaDB Client
+chroma_client = Client(Settings(allow_reset=True))
 
 
+# Create a unique collection for each PDF
+def get_pdf_collection(pdf_id):
+    return chroma_client.get_or_create_collection(name=f"pdf_{pdf_id}")
+
+
+# ==============================
+# 📄 دوال معالجة الـ PDF
+# ==============================
+def extract_text_from_pdf(pdf_file):
+    reader = PyPDF2.PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+
+def split_text_into_chunks(text, chunk_size=500, overlap=50):
+    chunks = []
+    for i in range(0, len(text), chunk_size - overlap):
+        chunks.append(text[i:i + chunk_size])
+    return chunks
+
+
+# ==============================
+# 🛡️ النقاط الطرفية (Endpoints)
+# ==============================
 @app.route('/upload_file', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files: return jsonify({"status": "error"}), 400
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
     file = request.files['file']
-    try:
-        text_content = ""
-        pdf_reader = PyPDF2.PdfReader(file)
-        for page in pdf_reader.pages: text_content += page.extract_text()
-        chunks = [text_content[i:i + 600] for i in range(0, len(text_content), 600)]
-        ids = [f"{file.filename}_{i}" for i in range(len(chunks))]
-        collection.add(documents=chunks, ids=ids, metadatas=[{"source": file.filename}] * len(chunks))
-        return jsonify({"status": "success", "message": "تم الاستيعاب!"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    if file:
+        try:
+            # Generate a unique ID for this PDF
+            pdf_id = str(uuid.uuid4())
+            text = extract_text_from_pdf(file)
+            chunks = split_text_into_chunks(text)
+
+            # Use ChromaDB for storage
+            collection = get_pdf_collection(pdf_id)
+            ids = [f"id_{i}" for i in range(len(chunks))]
+            collection.add(documents=chunks, ids=ids)
+
+            # Return pdf_id to the frontend
+            return jsonify({"message": "تم الاستيعاب بنجاح! ✅", "pdf_id": pdf_id}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
 @app.route('/ask', methods=['POST'])
-def ask():
-    data = request.json
-    user_query = data.get('question', '').strip()
+def ask_question():
+    data = request.get_json()
+    question = data.get('question')
+    pdf_id = data.get('pdf_id')
+
+    if not question or not pdf_id:
+        return jsonify({"error": "Question or PDF ID missing"}), 400
+
     try:
-        # استرجاع 5 نتائج لضمان الدقة
-        results = collection.query(query_texts=[user_query], n_results=5)
-        context = " ".join(results['documents'][0]) if results['documents'] else ""
+        # 1. Retrieve the most relevant chunks from ChromaDB
+        collection = get_pdf_collection(pdf_id)
+        results = collection.query(query_texts=[question], n_results=3)
+        relevant_chunks = results['documents'][0]
 
-        prompt = f"أجب باختصار من النص التالي:\n{context}\nالسؤال: {user_query}"
-        response = llm_model.generate_content(prompt)
+        # 2. Construct the prompt for Gemini
+        context = "\n".join(relevant_chunks)
+        prompt = f"""
+        استناداً إلى السياق التالي من ملف PDF المرفوع:
+        ---
+        {context}
+        ---
+        السؤال: {question}
+        ---
+        يرجى تقديم إجابة دقيقة وبناءة بناءً على هذا السياق فقط. إذا لم تكن الإجابة موجودة، قل "لا يمكنني العثور على الإجابة في هذا المستند".
+        """
 
-        return jsonify({"response": response.text})
+        # 3. Get the answer from Gemini
+        response = model.generate_content(prompt)
+        answer = response.text
+
+        return jsonify({"message": answer}), 200
     except Exception as e:
-        if "429" in str(e): return jsonify({"response": "السيرفر مضغوط، انتظر دقيقة."})
-        return jsonify({"response": f"حدث خطأ: {str(e)}"})
+        return jsonify({"error": str(e)}), 500
 
 
+# ==============================
+# ✨ نقطة النهاية لفحص الصحة (Health Check)
+# جرب تفتح هذا الرابط: / (بدون أي شي بعده)
+# ==============================
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({"status": "Server is Live 🚀", "message": "Backend for HAMOUD AI"}), 200
+
+
+# ==============================
+# ⚙️ تشغيل السيرفر
+# ==============================
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # تأكد إن البورت مرفوع لـ 10000 ليتوافق مع Render
+    app.run(host='0.0.0.0', port=10000)
