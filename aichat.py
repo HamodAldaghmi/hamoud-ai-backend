@@ -1,13 +1,15 @@
 import os
 import google.generativeai as genai
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import PyPDF2
 import chromadb
 from chromadb.utils import embedding_functions
 
+from flask_cors import CORS
+
 app = Flask(__name__)
-CORS(app)
+# هذا السطر يسمح للـ React يكلم السيرفر من أي مكان
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- 1. إعداد Gemini بمفتاحك الجديد ---
 API_KEY = "AIzaSyC50y3Dkor20IV3CXnLKIVQDKF_5I3_PPU"
